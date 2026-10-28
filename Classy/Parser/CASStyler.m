@@ -27,13 +27,15 @@
 
 // http://www.cocoawithlove.com/2010/01/getting-subclasses-of-objective-c-class.html
 NSArray *ClassGetSubclasses(Class parentClass) {
-    int numClasses = objc_getClassList(NULL, 0);
-    Class *classes = NULL;
-    classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
-    numClasses = objc_getClassList(classes, numClasses);
-    
+    // objc_copyClassList returns one snapshot together with its exact length. Sizing the buffer
+    // with objc_getClassList(NULL, 0) and filling it with a second call is not safe: the second
+    // call returns the current total, so a class registered in between made the loop read past
+    // the end of the buffer.
+    unsigned int numClasses = 0;
+    Class __unsafe_unretained *classes = objc_copyClassList(&numClasses);
+
     NSMutableArray *result = [NSMutableArray array];
-    for (NSInteger i = 0; i < numClasses; i++) {
+    for (unsigned int i = 0; i < numClasses; i++) {
         Class superClass = classes[i];
         do {
             superClass = class_getSuperclass(superClass);
