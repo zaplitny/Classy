@@ -25,30 +25,13 @@
 #import "UIViewController+CASAdditions.h"
 #import <objc/runtime.h>
 
-// http://www.cocoawithlove.com/2010/01/getting-subclasses-of-objective-c-class.html
-NSArray *ClassGetSubclasses(Class parentClass) {
-    // objc_copyClassList returns one snapshot together with its exact length. Sizing the buffer
-    // with objc_getClassList(NULL, 0) and filling it with a second call is not safe: the second
-    // call returns the current total, so a class registered in between made the loop read past
-    // the end of the buffer.
-    unsigned int numClasses = 0;
-    Class __unsafe_unretained *classes = objc_copyClassList(&numClasses);
-
-    NSMutableArray *result = [NSMutableArray array];
-    for (unsigned int i = 0; i < numClasses; i++) {
-        Class superClass = classes[i];
-        do {
-            superClass = class_getSuperclass(superClass);
-        } while(superClass && superClass != parentClass);
-        
-        if (superClass == nil) {
-            continue;
-        }
-        
-        [result addObject:classes[i]];
-    }
-    free(classes);
-    return result;
+// Walks the superclass chain, so neither class is messaged.
+static BOOL ClassIsStrictSubclassOfClass(Class aClass, Class parentClass) {
+    Class superClass = aClass;
+    do {
+        superClass = class_getSuperclass(superClass);
+    } while (superClass && superClass != parentClass);
+    return superClass != nil;
 }
 
 
@@ -61,6 +44,9 @@ NSArray *ClassGetSubclasses(Class parentClass) {
 @property (nonatomic, strong) NSMutableArray *fileWatchers;
 @property (nonatomic, strong) NSMutableArray *invocationObjectArguments;
 @property (nonatomic, strong) NSMutableDictionary *styleClassIndex;
+// Style nodes selected by object class, in precedence order
+@property (nonatomic, strong) NSMutableArray *objectClassStyleNodes;
+// Class name -> the nodes of objectClassStyleNodes that select that class, filled in on first use
 @property (nonatomic, strong) NSMutableDictionary *objectClassIndex;
 
 @end
@@ -95,6 +81,7 @@ NSArray *ClassGetSubclasses(Class parentClass) {
     self.scheduledItems = [NSHashTable hashTableWithOptions:NSHashTableWeakMemory];
     self.fileWatchers = NSMutableArray.new;
     self.styleClassIndex = [NSMutableDictionary new];
+    self.objectClassStyleNodes = [NSMutableArray new];
     self.objectClassIndex = [NSMutableDictionary new];
     [self setupObjectClassDescriptors];
 
@@ -110,8 +97,8 @@ NSArray *ClassGetSubclasses(Class parentClass) {
     NSMutableArray *possibleStyleNodes = [NSMutableArray new];
     
     Class class = [item class];
-    [possibleStyleNodes addObjectsFromArray:[self.objectClassIndex valueForKey:NSStringFromClass(class)]];
-    
+    [possibleStyleNodes addObjectsFromArray:[self styleNodesForObjectClass:class]];
+
     NSArray *styleClasses = [item.cas_styleClass componentsSeparatedByString:CASStyleClassSeparator];
     
     for (NSString *styleClass in styleClasses) {
@@ -155,10 +142,11 @@ NSArray *ClassGetSubclasses(Class parentClass) {
 - (void)setFilePath:(NSString *)filePath error:(NSError **)error {
     if ([_filePath isEqualToString:filePath]) return;
     _filePath = filePath;
-    
+
     self.styleClassIndex = [NSMutableDictionary new];
+    self.objectClassStyleNodes = [NSMutableArray new];
     self.objectClassIndex = [NSMutableDictionary new];
-    
+
     NSArray *styleNodes = nil;
     NSSet *importedFileNames = nil;
     
@@ -253,25 +241,31 @@ NSArray *ClassGetSubclasses(Class parentClass) {
             }
             [[self.styleClassIndex valueForKey:styleClassKey] addObject:styleNode];
         } else {
-            
-            Class class = styleNode.styleSelector.objectClass;
-            if (![self.objectClassIndex valueForKey:NSStringFromClass(class)]) {
-                [self.objectClassIndex setValue:[@[] mutableCopy] forKey:NSStringFromClass(class)];
-            }
-            [[self.objectClassIndex valueForKey:NSStringFromClass(class)] addObject:styleNode];
-            
-            if (styleNode.styleSelector.shouldSelectSubclasses) {
-                // add an entry in the lookup table for each subclass
-                NSArray *subclasses = ClassGetSubclasses(class);
-                for (Class class in subclasses) {
-                    if (![self.objectClassIndex valueForKey:NSStringFromClass(class)]) {
-                        [self.objectClassIndex setValue:[@[] mutableCopy] forKey:NSStringFromClass(class)];
-                    }
-                    [[self.objectClassIndex valueForKey:NSStringFromClass(class)] addObject:styleNode];
-                }
-            }
+            // Indexed per class on first use (styleNodesForObjectClass:). Listing the subclasses
+            // here took objc_copyClassList, which realizes every class of every loaded image:
+            // over a second at launch on a device.
+            [self.objectClassStyleNodes addObject:styleNode];
         }
     }
+}
+
+- (NSArray *)styleNodesForObjectClass:(Class)class {
+    NSString *className = NSStringFromClass(class);
+    if (!className) return nil;
+
+    NSArray *classStyleNodes = self.objectClassIndex[className];
+    if (classStyleNodes) return classStyleNodes;
+
+    NSMutableArray *matchingNodes = NSMutableArray.new;
+    for (CASStyleNode *styleNode in self.objectClassStyleNodes) {
+        Class objectClass = styleNode.styleSelector.objectClass;
+        if (class == objectClass
+            || (styleNode.styleSelector.shouldSelectSubclasses && ClassIsStrictSubclassOfClass(class, objectClass))) {
+            [matchingNodes addObject:styleNode];
+        }
+    }
+    self.objectClassIndex[className] = matchingNodes;
+    return matchingNodes;
 }
 
 - (NSArray *)invocationsForClass:(Class)aClass styleProperty:(CASStyleProperty *)styleProperty keyPath:(NSString *)keypath {
